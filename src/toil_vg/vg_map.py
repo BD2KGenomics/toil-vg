@@ -21,7 +21,7 @@ from toil.job import Job
 from toil.realtimeLogger import RealtimeLogger
 from toil_vg.vg_common import *
 from toil_vg.context import Context, run_write_info_to_outstore
-from toil_vg.vg_surject import *
+from toil_vg.vg_surject import run_merge_bams, run_whole_surject 
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +270,13 @@ def run_split_reads(job, context, fastq, gam_input_reads, bam_input_reads, reads
 
 
 def run_split_fastq(job, context, fastq, fastq_i, sample_fastq_id):
-    
+   
+    disk_required = job.fileStore.getGlobalFileSize(sample_fastq_id) * 2 + (2 * 1024**3)
+    requeued = ensure_disk_bytes(job, run_split_fastq, disk_required)
+    if requeued is not None:
+        # If not, requeue the job with more disk.
+        return requeued
+   
     RealtimeLogger.info("Starting fastq split")
     start_time = timeit.default_timer()
     
@@ -322,6 +328,13 @@ def run_split_fastq(job, context, fastq, fastq_i, sample_fastq_id):
 def run_split_gam_reads(job, context, gam_input_reads, gam_reads_file_id):
     """ split up an input reads file in GAM format
     """
+    
+    disk_required = job.fileStore.getGlobalFileSize(gam_reads_file_id) * 2 + (2 * 1024**3)
+    requeued = ensure_disk_bytes(job, run_split_gam_reads, disk_required)
+    if requeued is not None:
+        # If not, requeue the job with more disk.
+        return requeued
+    
     RealtimeLogger.info("Starting gam split")
     start_time = timeit.default_timer()
     
@@ -358,6 +371,13 @@ def run_split_gam_reads(job, context, gam_input_reads, gam_reads_file_id):
 def run_split_bam_reads(job, context, bam_input_reads, bam_reads_file_id):
     """ split up an input reads file in BAM format
     """
+    
+    disk_required = job.fileStore.getGlobalFileSize(bam_reads_file_id) * 2 + (2 * 1024**3)
+    requeued = ensure_disk_bytes(job, run_split_bam_reads, disk_required)
+    if requeued is not None:
+        # If not, requeue the job with more disk.
+        return requeued
+    
     RealtimeLogger.info("Starting bam split")
     start_time = timeit.default_timer()
     
@@ -483,7 +503,8 @@ def run_chunk_alignment(job, context, gam_input_reads, bam_input_reads, sample_n
     Takes a dict from index type to index file ID. Some indexes are extra and
     specifying them will change mapping behavior.
     """
-                        
+    
+    # TODO: Work out what indexes we will want and ensure_disk_bytes
 
     RealtimeLogger.info("Starting {} alignment on {} chunk {}".format(mapper, sample_name, chunk_id))
 
@@ -757,12 +778,24 @@ def run_merge_gams(job, context, sample_name, id_ranges_file_id, gam_chunk_file_
             total_running_time += float(running_time)
     
     return chr_gam_ids, total_running_time
-
+    
 def run_merge_chrom_gam(job, context, sample_name, chr_name, chunk_file_ids):
     """
-    Make a chromosome gam by merging up a bunch of gam ids, one 
-    for each  shard.  
+    Make a chromosome gam by merging up a list of gam ids, one 
+    for each  shard.
     """
+    
+    RealtimeLogger.info('For chrom {}, merge files: {}'.format(chr_name, chunk_file_ids))
+    RealtimeLogger.info('Args: {} {} {} {} {}'.format(job, context, sample_name, chr_name, chunk_file_ids))
+    
+    # Check disk requirements to make sure we have enough room for 2 copies of everything, plus a bit.
+    # Get file size in a way that is robust to strs
+    disk_required = sum((job.fileStore.getGlobalFileSize(gam) for gam in chunk_file_ids)) * 2 + (2 * 1024**3)
+    requeued = ensure_disk_bytes(job, run_merge_chrom_gam, disk_required)
+    if requeued is not None:
+        # If not, requeue the job with more disk.
+        return requeued
+    
     # Define work directory for docker calls
     work_dir = job.fileStore.getLocalTempDir()
     
@@ -775,6 +808,7 @@ def run_merge_chrom_gam(job, context, sample_name, chr_name, chunk_file_ids):
         with open(output_file, 'ab') as merge_file:
             for chunk_gam_id in chunk_file_ids:
                 tmp_gam_file = os.path.join(work_dir, 'tmp_{}.gam'.format(uuid4()))
+                RealtimeLogger.info('Download file ID {} to {}'.format(chunk_gam_id, tmp_gam_file))
                 job.fileStore.readGlobalFile(chunk_gam_id, tmp_gam_file)
                 with open(tmp_gam_file, 'rb') as tmp_f:
                     shutil.copyfileobj(tmp_f, merge_file)

@@ -15,6 +15,7 @@ import pkg_resources, tempfile, datetime
 import logging
 from distutils.spawn import find_executable
 import collections
+import inspect
 import socket
 import uuid
 import platform
@@ -918,6 +919,60 @@ def title_to_filename(kind, i, title, extension):
         
     return ''.join(part_list)
     
+    
+def ensure_disk_bytes(job, job_function, required_disk_bytes):
+    """
+    Make sure the give running job is running with at least the given number of
+    disk bytes.
+    
+    If so, returns None.
+
+    If not, queues up the job_function again with the same arguments and the
+    given disk limit, and returns a promise for the value the caller should
+    return.
+    
+    Should be called directly by a Toil job function and not through an
+    intermediate.
+    
+    Will cause problems if anyone has already added child jobs to the job being
+    re-queued that expect to work with its return value.
+    """
+    
+    if job.disk < required_disk_bytes:
+        # We need more space
+        
+        # Grab our caller's stack frame.
+        job_frame = inspect.stack()[1][0]
+        try:
+            # Grab the arg names and the dict to look them up in
+            (job_run_args, job_run_varargs, job_run_kwargs, job_locals) = inspect.getargvalues(job_frame)
+            # Drop the job argument itself and look them all up in job_locals.
+            # job_run_args[0]'s value should always be the job itself, and we don't need to pass that along.
+            job_rerun_args = [job_locals[name] for name in job_run_args[1:]]
+            if job_run_varargs is not None:
+                # Append all the varargs arguments to the call
+                job_run_args += job_locals[job_run_varargs]
+            
+            # Get the base kwargs that came into the job, or {} if there were none
+            job_rerun_kwargs = {} if job_run_kwargs is None else dict(job_locals[job_run_kwargs])
+            # Add the cores/memory/disk that Toil will pull out
+            job_rerun_kwargs.update({"cores": job.cores, "memory": job.memory, "disk": required_disk_bytes})
+            
+            RealtimeLogger.info("Re-queueing {} because we only have {}/{} estimated necessary disk space.".format(
+                job_function.__name__, job.disk, required_disk_bytes))
+            # Queue the job again as a child with more disk.
+            promise = job.addChildJobFn(job_function, *job_rerun_args, **job_rerun_kwargs).rv()
+            
+            return promise
+        finally:
+            del job_frame
+    
+    else:
+        # The job has sufficient disk
+        RealtimeLogger.info("Job {} has {}/{} estimated necessary disk space.".format(
+                job_function.__name__, job.disk, required_disk_bytes))
+        
+        return None
     
 def ensure_disk(job, job_fn, job_fn_args, job_fn_kwargs, file_id_list, factor=8, padding=1024 ** 3):
     """
