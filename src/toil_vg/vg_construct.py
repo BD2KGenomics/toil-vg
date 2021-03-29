@@ -59,6 +59,8 @@ def construct_subparser(parser):
     parser.add_argument("--alt_regions_bed", type=make_url,
                         help="BED file mapping alt regions (cols 1-3) to sequence names (col 4) from the FASTA. "
                         "Alt regions will be aligned to the graph using vg msga")
+    parser.add_argument("--coalesce_regions", type=make_url,
+                        help="File of tab-separated sets of sequence names for batching construction jobs, one per line.")
     parser.add_argument("--max_node_size", type=int, default=32,
                         help="Maximum node length")
     parser.add_argument("--alt_paths", action="store_true",
@@ -358,15 +360,23 @@ def run_fix_chrom_names(job, context, to_ucsc, regions, fasta_ids, fasta_names,
     out_regions = []
     something_to_rename = False
 
-    # map the regions
+    # Map the regions.
+    # Some regions may map to the same region as a previous region if e.g. we
+    # fetched region names out of the FASTA. So deduplicate here.
+    done_regions = set()
     for region in regions:
         region_name = region.split(':')[0]
         if region_name in name_map:
             something_to_rename = True
-            out_regions.append(name_map[region_name] + region[len(region_name):])
+            renamed_region = name_map[region_name] + region[len(region_name):]
+            if renamed_region not in done_regions:
+                out_regions.append(renamed_region)
+                done_regions.add(renamed_region)
         else:
             something_to_rename = something_to_rename or region_name in list(name_map.values())
-            out_regions.append(region)
+            if region not in done_regions:
+                out_regions.append(region)
+                done_regions.add(region)
         
     # map the vcf
     out_vcf_ids = []
@@ -479,7 +489,26 @@ def run_subtract_alt_regions(job, context, alt_regions_id, regions):
                 alt_regions.add(toks[3])
                 
     return [region for region in regions if region not in alt_regions], list(alt_regions)
-        
+    
+def run_read_coalesce_list(job, context, coalesce_regions_id):
+    """
+    Read the given input file.
+    Produce a list of sets of region/contig names to coalesce into single jobs.
+    Treats the input file as tab-separated, one set per line.
+    """
+    
+    work_dir = job.fileStore.getLocalTempDir()
+    coalesce_regions_path = os.path.join(work_dir, 'coalesce-regions.tsv')
+    job.fileStore.readGlobalFile(coalesce_regions_id, coalesce_regions_path)
+    coalesce_regions = []
+    with open(coalesce_regions_path) as in_regions:
+        for line in in_regions:
+            toks = line.strip().split('\t')
+            if len(toks) > 0 and toks[0] != '' and toks[0][0] != '#':
+                coalesce_regions.append(set(toks))
+    
+    return coalesce_regions
+                
 def run_generate_input_vcfs(job, context, vcf_ids, vcf_names, tbi_ids,
                             regions, output_name,
                             do_primary = False,
@@ -692,13 +721,17 @@ def run_construct_all(job, context, fasta_ids, fasta_names, vcf_inputs,
                       wanted_indexes = set(), 
                       haplo_extraction_sample = None, haplotypes = [0,1], gbwt_prune = False,
                       normalize = False, validate = False, alt_regions_id = None,
-                      alt_regions = []):
+                      alt_regions = [], coalesce_regions = []):
     """ 
     construct many graphs in parallel, optionally doing indexing too. vcf_inputs
     is a list of tuples as created by run_generate_input_vcfs
     
     Returns a list of tuples of the form (vg_ids, vg_names, indexes), where
     indexes is the index dict from index type to file ID.
+    
+    If coalesce_regions is set (and alt_regions is not), it must be a list of
+    sets of region names. Each set of region names will be run together as a
+    single construction job, replacing the individual jobs for those regions.
     
     """
 
@@ -714,14 +747,15 @@ def run_construct_all(job, context, fasta_ids, fasta_names, vcf_inputs,
                                           max_node_size, ('gbwt' in wanted_indexes) or haplo_extraction or alt_paths,
                                           flat_alts, handle_svs, regions,
                                           region_names, sort_ids, join_ids, name, merge_output_name,
-                                          normalize and name != 'haplo', validate, alt_regions_id)
-
+                                          normalize and name != 'haplo', validate, alt_regions_id,
+                                          coalesce_regions=coalesce_regions)
+                                          
         mapping_id = construct_job.rv('mapping')
         
         # Find the joined VG files, which always exist
         joined_vg_ids = construct_job.rv('joined')
         # And give them names
-        joined_vg_names = [remove_ext(i, '.vg') + '.vg' for i in region_names] 
+        joined_vg_names = construct_job.rv('joined_names')
         
         if merge_graphs or not regions or len(regions) < 2: 
             # Sometimes we will have a single VG file also
@@ -742,6 +776,8 @@ def run_construct_all(job, context, fasta_ids, fasta_names, vcf_inputs,
             
             # Get the chromosome names
             chroms = [p.split(':')[0] for p in regions]
+            
+            RealtimeLogger.info('Operating on chromosomes: %s', chroms)
             
             # Make sure we have no more than 1 region per chromosome.
             # Otherwise GBWT region restriction will mess things up.
@@ -788,24 +824,28 @@ def run_construct_all(job, context, fasta_ids, fasta_names, vcf_inputs,
                 join_job = sample_job.addFollowOnJobFn(run_join_graphs, context, sample_job.rv(),
                                                        False, region_names, name, sample_merge_output_name,
                                                        cores=context.config.construct_cores,
-                                                       memory=context.config.construct_mem,
-                                                       disk=context.config.construct_disk)
+                                                       memory=context.config.xg_index_mem,
+                                                       disk=context.config.xg_index_disk)
 
                 # Want to keep a whole-genome withref xg index around for mapeval purposes
                 if len(regions) > 1 and ('xg' in wanted_indexes):
                     wanted = set('xg')
                     construct_job.addFollowOnJobFn(run_indexing, context, joined_vg_ids,
                                                    joined_vg_names, output_name_base, chroms, [], [], 
-                                                   wanted=wanted)
+                                                   wanted=wanted, coalesce_regions=coalesce_regions)
                 
-                index_prev_job = join_job
                 # In the indexing step below, we want to index our haplo-extracted sample graph
                 # So replace the withref graph IDs and names with these
                 
                 # Find the joined VG files, which always exist
                 joined_vg_ids = join_job.rv('joined')
                 # And give them names
-                joined_vg_names = [n.replace('_withref', '') for n in joined_vg_names]
+                rename_job = join_job.addFollowOnJobFn(run_remove_withref, context, joined_vg_names,
+                                                       cores=context.config.misc_cores,
+                                                       memory=context.config.misc_mem,
+                                                       disk=context.config.misc_disk)
+                joined_vg_names = rename_job.rv()
+                index_prev_job = rename_job
                 
                 if sample_merge_output_name:
                     # We expect a single output graph too
@@ -854,23 +894,37 @@ def run_construct_all(job, context, fasta_ids, fasta_names, vcf_inputs,
                                                        wanted=wanted,
                                                        gbwt_prune=gbwt_prune and 'gbwt' in wanted,
                                                        gbwt_regions=gbwt_regions,
-                                                       dont_restore_paths=alt_regions)
+                                                       dont_restore_paths=alt_regions,
+                                                       coalesce_regions=coalesce_regions)
         indexes = indexing_job.rv()    
 
         output.append((joined_vg_ids, joined_vg_names, indexes))
     return output
+    
+def run_remove_withref(job, context, joined_vg_names):
+    """
+    Return the names in joined_vg_names with '_withref' removed from them.
+    """
+    
+    return [n.replace('_withref', '') for n in joined_vg_names]
                 
 
 def run_construct_genome_graph(job, context, fasta_ids, fasta_names, vcf_ids, vcf_names, tbi_ids,
                                max_node_size, alt_paths, flat_alts, handle_svs, regions, region_names,
-                               sort_ids, join_ids, name, merge_output_name, normalize, validate, alt_regions_id):
+                               sort_ids, join_ids, name, merge_output_name, normalize, validate,
+                               alt_regions_id, coalesce_regions=[]):
     """
     
     Construct graphs from one or more FASTA files and zero or more VCFs.
     
     If regions and region_names are set, constructs only for the specified
-    regions, and constructs one graph per region. Otherwise, constructs one
-    graph overall on a single default region.
+    regions, and constructs one graph per region (except if coalesce_regions is
+    set; see below). Otherwise, constructs one graph overall on a single
+    default region.
+    
+    If coalesce_regions is set (and alt_regions_id is not), it must be a list
+    of sets of region names. Each set of region names will be run together as a
+    single construction job, replacing the individual jobs for those regions.
     
     If merge_output_name is set, merges all constructed graphs together and
     outputs them under that name. Otherwise, outputs each graph constructed
@@ -895,8 +949,12 @@ def run_construct_genome_graph(job, context, fasta_ids, fasta_names, vcf_ids, vc
     work_dir = job.fileStore.getLocalTempDir()
 
     if not regions:
-        regions, region_names = [None], ['genome']        
-
+        regions, region_names = [None], ['genome']
+        
+    if not alt_regions_id:
+        # Coalesce regions (which we can't yet do if also running MSGA)
+        regions, region_names = apply_coalesce(regions, region_names=region_names, coalesce_regions=coalesce_regions)
+            
     region_graph_ids = []    
     for i, (region, region_name) in enumerate(zip(regions, region_names)):
         if not vcf_ids or (len(vcf_ids) > 1 and i >= len(vcf_ids)):
@@ -947,8 +1005,8 @@ def run_construct_genome_graph(job, context, fasta_ids, fasta_names, vcf_ids, vc
     return child_job.addFollowOnJobFn(run_join_graphs, context, region_graph_ids, join_ids,
                                       region_names, name, merge_output_name,
                                       cores=context.config.construct_cores,
-                                      memory=context.config.construct_mem,
-                                      disk=context.config.construct_disk).rv()
+                                      memory=context.config.xg_index_mem,
+                                      disk=context.config.xg_index_disk).rv()
 
 def run_join_graphs(job, context, region_graph_ids, join_ids, region_names, name, merge_output_name = None):
     """
@@ -969,6 +1027,8 @@ def run_join_graphs(job, context, region_graph_ids, join_ids, region_names, name
     'joined': a list of the unmerged, id-joined graph file IDs (or the input
     graph(s) re-uploaded as output files if no joining occurred)
     
+    'joined_names': a list of .vg filenames for those graphs 
+    
     'merged': the merged graph file ID, if merging occurred, or the only input
     graph ID, if there was only one. None otherwise.
     
@@ -982,10 +1042,13 @@ def run_join_graphs(job, context, region_graph_ids, join_ids, region_names, name
     # Download graph for each region.
     # To keep command line lengths short we name the files by numbers.
     region_files = []
+    # But track their human-readable names
+    human_names = []
     for number, (region_graph_id, region_name) in enumerate(zip(region_graph_ids, region_names)):
         region_file = '{}.vg'.format(number)
         job.fileStore.readGlobalFile(region_graph_id, os.path.join(work_dir, region_file), mutable=True)
         region_files.append(region_file)
+        human_names.append(remove_ext(region_name, '.vg') + '.vg')
 
     if merge_output_name:
         merge_output_name = remove_ext(merge_output_name, '.vg') + '.vg'
@@ -994,6 +1057,7 @@ def run_join_graphs(job, context, region_graph_ids, join_ids, region_names, name
     # set to make asking for things with .rv() easier.
     to_return = {
         'joined': [],
+        'joined_names': human_names,
         'merged': None,
         'mapping': None
     }
@@ -1028,7 +1092,8 @@ def run_join_graphs(job, context, region_graph_ids, join_ids, region_names, name
         
         if join_ids and len(region_files) != 1:
             # If we do all the merging, and we made new joined graphs, write the joined graphs as intermediates
-            to_return['joined'] = [context.write_intermediate_file(job, os.path.join(work_dir, f)) for f in region_files]
+            to_return['joined'] = [context.write_intermediate_file(job, os.path.join(work_dir, f), dest)
+                                   for f, dest in zip(region_files, human_names)]
         else:
             # We can just pass through the existing intermediate files without re-uploading
             to_return['joined'] = region_graph_ids
@@ -1036,7 +1101,10 @@ def run_join_graphs(job, context, region_graph_ids, join_ids, region_names, name
         # No merging happened, so the id-joined files need to be output files.
         # We assume they came in as intermediate files, even if we didn't join them.
         # So we defintiely have to write them.
-        to_return['joined'] = [context.write_output_file(job, os.path.join(work_dir, f)) for f in region_files]
+        # And we need to make sure to write them under their assigned
+        # region-based names, even if we downloaded them to shorter names.
+        to_return['joined'] = [context.write_output_file(job, os.path.join(work_dir, f), dest)
+                               for f, dest in zip(region_files, human_names)]
                     
     return to_return 
         
@@ -1046,6 +1114,9 @@ def run_construct_region_graph(job, context, fasta_id, fasta_name, vcf_id, vcf_n
                                is_chrom = False, sort_ids = True, normalize = False, validate = False):
     """
     Construct a graph from the vcf for a given region and return its file id.
+    
+    region may be a FASTA contig id, a set of FASTA contig IDs, or None for
+    using the whole FASTA.
     
     If is_chrom is set, pass along that fact to the constructor so it doesn't
     try to pass a region out of the chromosome name.
@@ -1075,7 +1146,11 @@ def run_construct_region_graph(job, context, fasta_id, fasta_name, vcf_id, vcf_n
     if vcf_id:
         cmd += ['--vcf', os.path.basename(vcf_file)]
     if region:
-        cmd += ['--region', region]
+        if isinstance(region, str):
+            cmd += ['--region', region]
+        else:
+            for fasta_id in region:
+                cmd += ['--region', fasta_id]
         if is_chrom:
             cmd += ['--region-is-chrom']
     if max_node_size:
@@ -1476,7 +1551,7 @@ def run_make_haplo_thread_graphs(job, context, vg_id, vg_name, output_name, chro
                 # Now combine the two files, adding the paths to the graph
                 vg_with_thread_as_path_path = os.path.join(work_dir, '{}{}_thread_{}_merge.vg'.format(output_name, tag, hap))
                 logger.info('Creating thread graph {}'.format(vg_with_thread_as_path_path))
-                cmd = ['vg', 'combine', base_graph_filename, path_graph_filename]
+                cmd = ['vg', 'combine', '-c', base_graph_filename, path_graph_filename]
                 with open(vg_with_thread_as_path_path, 'wb') as out_file:
                     context.runner.call(job, cmd, work_dir = work_dir, outfile = out_file)
                     
@@ -1677,7 +1752,8 @@ def construct_main(context, options):
             if options.regions_file:
                 inputRegionsFileID = importer.load(options.regions_file)
 
-            alt_regions_id = importer.load(options.alt_regions_bed) if options.alt_regions_bed else None                
+            alt_regions_id = importer.load(options.alt_regions_bed) if options.alt_regions_bed else None
+            coalesce_regions_id = importer.load(options.coalesce_regions) if options.coalesce_regions else None 
 
             importer.wait()
             inputFastaFileIDs = importer.resolve(inputFastaFileIDs)
@@ -1686,6 +1762,7 @@ def construct_main(context, options):
             inputBWAFastaID = importer.resolve(inputBWAFastaID)
             inputRegionsFileID = importer.resolve(inputRegionsFileID)
             alt_regions_id = importer.resolve(alt_regions_id)
+            coalesce_regions_id = importer.resolve(coalesce_regions_id)
 
             # We only support one haplotype extraction sample (enforced by validate) despire what CLI implies
             haplo_extraction_sample = options.haplo_sample if options.haplo_sample else options.sample_graph       
@@ -1757,7 +1834,8 @@ def construct_main(context, options):
                 regions = options.regions          
 
             # Preproces chromosome names everywhere to be consistent,
-            # either mapping from 1-->chr1 etc, or going the other way
+            # either mapping from 1-->chr1 etc, or going the other way.
+            # Deduplicate regions that become the same after renaming.
             if options.add_chr_prefix or options.remove_chr_prefix:
                 cur_job = cur_job.addFollowOnJobFn(run_fix_chrom_names, context,
                                                    options.add_chr_prefix,
@@ -1786,6 +1864,15 @@ def construct_main(context, options):
                 regions, alt_regions = cur_job.rv(0), cur_job.rv(1)
             else:
                 alt_regions=[]
+                
+            if coalesce_regions_id:
+                cur_job = cur_job.addFollowOnJobFn(run_read_coalesce_list,
+                                                   context,
+                                                   coalesce_regions_id)
+                coalesce_regions = cur_job.rv()
+            
+            else:
+                coalesce_regions=[]
 
             # Merge up comma-separated vcfs with bcftools merge
             cur_job = cur_job.addFollowOnJobFn(run_merge_all_vcfs, context,
@@ -1808,7 +1895,7 @@ def construct_main(context, options):
                                                filter_samples = filter_samples,
                                                min_afs = options.min_af,
                                                vcf_subdir = '{}-vcfs'.format(options.out_name) if options.keep_vcfs else None)
-                
+            
             # Construct graphs
             vcf_job.addFollowOnJobFn(run_construct_all, context, inputFastaFileIDs,
                                      inputFastaNames, vcf_job.rv(),
@@ -1822,7 +1909,8 @@ def construct_main(context, options):
                                      normalize = options.normalize,
                                      validate = options.validate,
                                      alt_regions_id = alt_regions_id,
-                                     alt_regions = alt_regions)
+                                     alt_regions = alt_regions,
+                                     coalesce_regions = coalesce_regions)
                                      
             
             if inputBWAFastaID:

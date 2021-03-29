@@ -524,6 +524,10 @@ to do: Should go somewhere more central """
             
         # When we get here, the container has been run, and stdout is either in the file object we sent it to or in the Docker logs.
         # stderr is always in the Docker logs.
+        
+        if isinstance(return_code, dict) and 'StatusCode' in return_code:
+            # New? Docker gives us a dict like this
+            return_code = return_code['StatusCode']
             
         if return_code != 0:
             # What were we doing?
@@ -1087,3 +1091,66 @@ class AsyncImporter(object):
             return result.result()
         else:
             return result
+            
+
+def apply_coalesce(regions, region_names=None, coalesce_regions=[]):
+    """
+    Given a list of regions, and a list of sets of regions to coalesce if all
+    are present, produce a list of regions or sets of regions, preserving the
+    original region order among the non-coalesced regions, with the sets at the
+    end.
+    
+    Also takes a list of region names. If not set, the regions themselves are
+    used.
+    
+    If all the regions in a set are present, they will all be pulled out of the
+    normal ordering and put in that set at the end.
+    
+    Returns (coalesced regions, coalesced region names)
+    """
+    
+    if not region_names:
+        region_names = regions
+    
+    wanted_regions = set(regions)
+    # We need to fake the output names for the coalesced regions based on
+    # the original ones. So map from region to region name.
+    region_to_name = dict(zip(regions, region_names))
+    # These will replace regions and region_names if we coalesce away regions
+    coalesced_regions = []
+    coalesced_names = []
+    coalesced_away = set()
+    
+    for to_coalesce in coalesce_regions:
+        # Find out if we have all the regions that need to be coalesced here.
+        have_all = True
+        for region in to_coalesce:
+            if region not in wanted_regions:
+                have_all = False
+                break
+        if have_all:
+            # Use this coalescing
+            coalesced_regions.append(to_coalesce)
+            
+            # Try and replace the region in its name, if possible, when naming the coalesced region.
+            region_in_name = region_to_name[region].rfind(region)
+            base_name = region_to_name[region][:region_in_name] if region_in_name != -1 else region_to_name[region]
+            coalesced_names.append("{}coalesced{}".format(base_name, len(coalesced_regions) - 1))
+            # And skip these regions
+            coalesced_away.update(to_coalesce)
+            
+    if len(coalesced_away) > 0:
+        # Drop the coalesced regions from regions
+        remaining_regions = []
+        remaining_names = []
+        for i in range(len(regions)):
+            if regions[i] not in coalesced_away:
+                remaining_regions.append(regions[i])
+                remaining_names.append(region_names[i])
+        # And replace the original regions with the coalesced ones, and the
+        # remaining uncoalesced regions. Put the remaining ones first because
+        # they are probably big chromosomes and may have associated VCFs.
+        regions = remaining_regions + coalesced_regions
+        region_names = remaining_names + coalesced_names
+        
+    return (regions, region_names)

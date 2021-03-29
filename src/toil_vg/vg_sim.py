@@ -280,8 +280,9 @@ def run_sim_chunk(job, context, gam, seed_base, xg_file_id, xg_annot_file_id, nu
             try:
                 context.runner.call(job, cmd, work_dir = work_dir, outfile=output_json)
                 if validate:
-                    context.runner.call(job, ['vg', 'validate', '--xg', os.path.basename(xg_file),
-                                              '--gam', os.path.basename(gam_file)], work_dir = work_dir)
+                    context.runner.call(job, ['vg', 'validate',
+                                              '--gam', os.path.basename(gam_file),
+                                              os.path.basename(xg_file)], work_dir = work_dir)
             except:
                 # Dump everything we need to replicate the problem
                 context.write_output_file(job, xg_file)

@@ -404,7 +404,7 @@ class VGCGLTest(TestCase):
         self._assertOutput('NA12877', self.local_outstore, f1_threshold=0.45)        
 
     def test_07_BRCA1_BRCA2_NA12877(self):
-        '''  Test pipeline on chase with two chromosomes, in this case both BRCA regions
+        '''  Test pipeline on case with two chromosomes, in this case both BRCA regions
         '''
         self._download_input('NA12877.brca1.brca2.bam.fq.gz')
         self._download_input('snp1kg-brca1.vg')
@@ -595,7 +595,39 @@ class VGCGLTest(TestCase):
             if prev_vg_size is not None:
                 assert vg_size <= prev_vg_size
             prev_vg_size = vg_size
-
+            
+    def test_10_construct_multiple_contigs(self):
+        '''  Test ability to group construction jobs, in the chape of GRCh38
+        '''
+        
+        chrom_names = [f'{x}' for x in range(1,23)] + ['X', 'Y']
+        vcf_bases = [f'chr{x}' for x in chrom_names] + ['others']
+        region_names = chrom_names + ['chrM']
+        
+        in_vcfs = [self._ci_input_path(f'GRCh38.1000gp.fake.{vcf_base}.vcf.gz') for vcf_base in vcf_bases]
+        in_tbis = [in_vcf + '.tbi' for in_vcf in in_vcfs]
+        in_fa = self._ci_input_path('GRCh38.fake.fa')
+        in_coalesce_regions = self._ci_input_path('GRCh38.1000gp.fake.minor_contigs.tsv')
+        out_name = 'Fake1000GP'
+       
+        print("Construct to " + self.local_outstore)
+       
+        command = ['toil-vg', 'construct', self.jobStoreLocal, self.local_outstore,
+                   '--container', self.containerType,
+                   '--clean', 'never',
+                   '--fasta', in_fa, '--vcf'] + in_vcfs + ['--vcf_phasing'] + in_vcfs + [
+                   '--regions'] + region_names + ['--fasta_regions', '--remove_chr_prefix',
+                   '--out_name', out_name, '--pangenome', '--filter_ceph', '--min_af', '0.01',
+                   '--all_index',
+                   '--realTimeLogging', '--logInfo', '--coalesce_regions', in_coalesce_regions]
+        
+        self._run(command)
+        self._run(['toil', 'clean', self.jobStoreLocal])
+        
+        for middle in ['_', '_filter_', '_minaf_0.01_']:
+            # Should now leave a coalesced region
+            self.assertTrue(os.path.isfile(os.path.join(self.local_outstore, '{}{}coalesced0.vg'.format(out_name, middle))))
+       
     def test_11_gbwt(self):
         '''
         Test that the gbwt gets constructed without crashing (but not much beyond that)
